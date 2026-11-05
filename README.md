@@ -6,17 +6,21 @@
 
 ## 📊 Real-World Benchmarks on ASUS Ascent GX10 (`Single 128 GB GB10`, Batch Size = 1)
 
-Wait-free, real-world single-user performance measured directly on **ASUS Ascent GX10 (`NVIDIA GB10`, `sm_121`, `128 GB` LPDDR5x Unified Memory)** against the official `404 GB` [`nvidia/DeepSeek-V4.1-Flash-1017-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4) checkpoint:
+Real-world single-user performance measured directly on a **single ASUS Ascent GX10 (`NVIDIA GB10`, `sm_121`, `128 GB` LPDDR5x Unified Memory)** against the official **`404 GB` [`nvidia/DeepSeek-V4.1-Flash-1017-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4)** checkpoint (`15,360` MoE experts across 40 layers + `33 GB` N-Gram Engram + `32`-layer Vision ViT):
 
-| Workload / Memory Mode | Cold Model Open (`mmap`) | Prompt Prefill (TTFT) | Generation Speed (Decode) | Active RAM Used | Notes |
-| :--- | :---: | :---: | :---: | :---: | :--- |
-| **🚀 `--mode 55gb` + `--mtp adaptive`** *(Recommended Fast Mode)* | `0.85 s` | `~1.1 – 1.8 s` *(short chat)* | **`16.95 tok/s`** (`59.0 ms/tok`) | **`~62 GB`** (`54.9 GB` experts + `7 GB` core) | `2,960` hot `Tier A` experts pinned in Unified Memory + 3-layer MTP (`100%` greedy match with `K=0`). |
-| **⚙️ `--mode 55gb` + `--mtp off`** *(Standard `K=0` Baseline)* | `0.85 s` | `~1.1 – 1.8 s` *(short chat)* | **`14.31 tok/s`** (`69.9 ms/tok`) | **`~62 GB`** | Pure single-token autoregressive decoding without speculative MTP (`69.9 ms/token`). |
-| **⚡ `--mode 7gb` + `--mtp adaptive`** *(Low-RAM Default)* | `0.88 s` | `~1.1 – 1.7 s` *(short chat)* | **`13.06 – 14.60 tok/s`** (`68 – 76 ms/tok`) | **`~7.2 GB`** (+ OS Page Cache) | Zero-copy `mmap` on-demand expert routing. Leaves **`> 110 GB` RAM free** for other workloads. |
-| **💿 `--mode tierc` (All `384/384` Experts)** *(Full `404 GB` NVMe)* | `0.88 s` | `~10.6 s` *(cold NVMe)* | **`2.57 tok/s`** (`389 ms/tok`) | **`~62 GB`** + NVMe stream | Activates all `15,360` experts (`384/layer`) + `33 GB` Engram (`0` skips). Bottlenecked by NVMe SSD read bandwidth (`404 GB > 128 GB` RAM). |
-| **👁️ Multimodal Vision (`--image`)** *(32-Layer ViT + Aligner)* | `0.88 s` | `15.76 s` (`1,296` image patches) | **`8.85 tok/s`** (`113 ms/tok`) | **`~9.5 GB`** | Full `756×756` image encoding (`32`-layer `deepseek_v41_vision` ViT + projector) + text generation. |
+> **Important Note on MoE Quality (`All 384 Experts Required`):**  
+> In `DeepSeek-V4.1-Flash-1017`, each of the 40 layers routes tokens to Top-6 out of **384 experts** (`Tier A` + `Tier B` + `Tier C`). **All 3 tiers (`384/384` experts per layer) must be active for real-world usage** — if you skip `Tier C` (`240/384` experts per layer), general prompts lose critical routing paths and produce degraded/garbage output. Therefore, **`--mode 7gb`, `--mode 55gb`, and `--mode tierc` all keep all 384 experts (`Tier A + B + C`) active by default.**
 
-### Built-In Speculative MTP Benchmark (`./bin/flash1017-gx10-linux-arm64 bench -m ./DeepSeek-V4.1-Flash-1017-NVFP4 --mode 55gb`)
+| Workload / Mode | Active Experts | Cold Startup (`mmap`) | Prompt Prefill (TTFT) | Decode Speed (`tok/s`) | Active RAM + Cache | Real-World Bottleneck & Behavior |
+| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| **⚡ `--mode 7gb` (Default — All 384 Experts On-Demand)** | **`384 / 384`** (`Tier A+B+C`) | **`0.89 s`** | **`~2.4 – 9.4 s`** *(warm vs cold cache)* | **`2.32 – 2.57 tok/s`** (`389–430 ms/tok`) | `~7.2 GB` pinned + `~110 GB` OS Page Cache | **Full model quality (0 skipped experts).** Since `404 GB > 128 GB` RAM, `~110 GB` of hot experts stay cached in RAM while uncached `Tier C` tail experts stream from NVMe via `MADV_WILLNEED` (`~2–2.5 GB/tok` NVMe read bound). |
+| **🚀 `--mode 55gb` / `--mode tierc` (55 GB Preload + All 384 Experts)** | **`384 / 384`** (`Tier A+B+C`) | **`0.89 s`** | **`~2.5 – 9.5 s`** | **`2.30 – 2.57 tok/s`** (`389–435 ms/tok`) | `~62 GB` pinned (`54.9 GB` Tier A + `7 GB` core) + `~55 GB` OS Page Cache | **Full model quality (0 skipped experts).** Pre-warms `2,960` hot `Tier A` experts (`54.88 GiB`) in RAM and streams remaining `Tier B + C` experts from NVMe on-demand. |
+| **👁️ Multimodal Vision (`--image`, 32-Layer ViT + Aligner)** | **`384 / 384`** (`Tier A+B+C`) | **`0.89 s`** | **`15.76 s`** (`1,296` image patches) | **`2.3 – 8.8 tok/s`** | `~9.5 GB` pinned + OS Page Cache | Encodes `756×756` images through the 32-layer `deepseek_v41_vision` ViT + projector before autoregressive text decoding. |
+| **🧪 `--mode pruned` (Experimental In-RAM Kernel Benchmark Only)** | *`144 / 384` (`Tier A+B` only)* | `0.85 s` | `~1.1 – 1.8 s` | **`14.31 – 16.95 tok/s`** (`59.0 ms/tok` w/ MTP) | `~62 GB` fits 100% in RAM (`0` NVMe reads) | **Kernel speed test only (not for general chat).** Disables `Tier C` NVMe streaming so all active weights fit inside `128 GB` RAM, proving the `sm_121` Blackwell `NVFP4` + `MTP` kernels reach **`16.95 tok/s`** when not bottlenecked by NVMe SSD I/O. |
+
+### Built-In Speculative MTP Kernel Benchmark (`./bin/flash1017-gx10-linux-arm64 bench -m ./DeepSeek-V4.1-Flash-1017-NVFP4 --mode pruned`)
+
+When measuring pure in-memory GB10 kernel throughput (`0` NVMe SSD page faults):
 
 ```text
 Mode              Tok/s    ms/tok   Steps   Acc%     Tok/Step   Match K0
@@ -67,13 +71,13 @@ huggingface-cli download nvidia/DeepSeek-V4.1-Flash-1017-NVFP4 \
 ```
 
 ### 3. Memory Profiles (`--mode 7gb | 55gb | tierc`)
-Run the exact same `DeepSeek-V4.1-Flash-1017-NVFP4` directory in three selectable memory modes depending on how much of your `128 GB Unified Memory` you want to allocate:
+All three standard profiles activate **all `15,360` MoE experts (`384/layer`: `Tier A + Tier B + Tier C`)** + the `33 GB` N-Gram Engram (`0` skipped experts, full model quality), differing only in how much RAM is pre-warmed vs dynamically cached by the OS Page Cache:
 
-| Memory Profile | CLI Flag / REPL | Active RAM | Description |
+| Memory Profile | CLI Flag / REPL | Pinned RAM | Description |
 | :--- | :--- | :--- | :--- |
-| **⚡ 7 GB Turbo** *(default)* | `--mode 7gb` / `/7gb` | `~7 GB` (+ OS Page Cache) | Routes the high-energy `Tier A + Tier B` expert core using [`bin/merkaba_tier_map.bin`](bin/merkaba_tier_map.bin) via on-demand Zero-Copy `mmap`. Leaves `> 110 GB` of RAM free for other workloads. |
-| **🚀 55 GB RAM Preload** | `--mode 55gb` / `/55gb` | `~55 GB` locked in RAM | Preloads and pins `2,960` hot `Tier A` experts (`54.88 GiB`) in Unified Memory (`0 ms` SSD page faults, maximum `tok/s`). |
-| **💿 Full 384-Expert (`Tier C`)** | `--mode tierc` / `/tierc` | `~55 GB` + NVMe Zero-Copy | Preloads `55 GB` in RAM and activates **all `15,360` MoE experts (`384/layer`)** + `33 GB` N-Gram Engram directly from `DeepSeek-V4.1-Flash-1017-NVFP4` (`0` skips). |
+| **⚡ 7 GB Turbo + All 384 Experts** *(default)* | `--mode 7gb` / `/7gb` | `~7 GB` (+ `~110 GB` OS Page Cache) | Pins only the `7 GB` backbone/KV and routes **all `384/384` experts (`Tier A + B + C`)** via on-demand Zero-Copy `mmap` + `MADV_WILLNEED` NVMe prefetch. Lets the Linux OS Page Cache manage `~110 GB` of hot experts dynamically. |
+| **🚀 55 GB RAM Preload + All 384 Experts** | `--mode 55gb` / `/55gb` | `~62 GB` (`54.9 GB` Tier A + `7 GB` core) | Pre-warms `2,960` hot `Tier A` experts (`54.88 GiB`) in Unified Memory and streams `Tier B + Tier C` experts via Zero-Copy `mmap` (`0` skips). |
+| **💿 Full 384-Expert (`Tier C` Alias)** | `--mode tierc` / `/tierc` | `~62 GB` + NVMe Zero-Copy | Identical to `55gb`: preloads `55 GB` Tier A in RAM and activates **all `15,360` MoE experts (`384/layer`)** + `33 GB` N-Gram Engram (`0` skips). |
 
 ---
 
