@@ -1,4 +1,7 @@
-# ⚡ Flash1017-Engine (`flash1017-gx10`) — Standalone GB10 Turbo Engine
+# ⚡ Flash1017-Engine (`flash1017-gx10`) — Standalone GB10 Turbo Engine (Experimental)
+
+> **🧪 Experimental Spin-Off Notice:**  
+> `Flash1017-Engine` is an early experimental standalone extraction from our main cognitive AI research project (**[Merkaba01 — https://terox27.github.io/](https://terox27.github.io/)**, where we use the `Tier A / Tier B / Tier C` expert split in a different way alongside an external cognitive memory architecture). We published this standalone runtime early so fellow GB10 / DGX Spark developers can experiment with it — the full integrated release is coming later at **[https://terox27.github.io/](https://terox27.github.io/)**.
 
 **`flash1017-gx10`** is a standalone, 100% closed-source, hardware-locked (`NVIDIA Grace Blackwell GB10 / sm_121`) inference engine and `vLLM` / `llama-server`-compatible HTTP/SSE server for **[`nvidia/DeepSeek-V4.1-Flash-1017-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4)** (`1T`-class MoE, `404 GB` on disk, `40` layers, `384` routed experts/layer + `33 GB` N-Gram Engram + `32`-layer Vision ViT) running on a **single ASUS Ascent GX10 / NVIDIA DGX Spark (`128 GB Unified Memory`)**.
 
