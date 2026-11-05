@@ -1,6 +1,32 @@
 # ⚡ Flash1017-Engine (`flash1017-gx10`) — Standalone GB10 Turbo Engine
 
-**`flash1017-gx10`** is a standalone, 100% closed-source, hardware-locked (`NVIDIA Grace Blackwell GB10 / sm_121`) inference engine and `vLLM` / `llama-server`-compatible HTTP/SSE server for **[`nvidia/DeepSeek-V4.1-Flash-1017-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4)** on **ASUS Ascent GX10 / NVIDIA DGX Spark (`128 GB Unified Memory`)**.
+**`flash1017-gx10`** is a standalone, 100% closed-source, hardware-locked (`NVIDIA Grace Blackwell GB10 / sm_121`) inference engine and `vLLM` / `llama-server`-compatible HTTP/SSE server for **[`nvidia/DeepSeek-V4.1-Flash-1017-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4)** (`1T`-class MoE, `404 GB` on disk, `40` layers, `384` routed experts/layer + `33 GB` N-Gram Engram + `32`-layer Vision ViT) running on a **single ASUS Ascent GX10 / NVIDIA DGX Spark (`128 GB Unified Memory`)**.
+
+---
+
+## 📊 Real-World Benchmarks on ASUS Ascent GX10 (`Single 128 GB GB10`, Batch Size = 1)
+
+Wait-free, real-world single-user performance measured directly on **ASUS Ascent GX10 (`NVIDIA GB10`, `sm_121`, `128 GB` LPDDR5x Unified Memory)** against the official `404 GB` [`nvidia/DeepSeek-V4.1-Flash-1017-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4) checkpoint:
+
+| Workload / Memory Mode | Cold Model Open (`mmap`) | Prompt Prefill (TTFT) | Generation Speed (Decode) | Active RAM Used | Notes |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **🚀 `--mode 55gb` + `--mtp adaptive`** *(Recommended Fast Mode)* | `0.85 s` | `~1.1 – 1.8 s` *(short chat)* | **`16.95 tok/s`** (`59.0 ms/tok`) | **`~62 GB`** (`54.9 GB` experts + `7 GB` core) | `2,960` hot `Tier A` experts pinned in Unified Memory + 3-layer MTP (`100%` greedy match with `K=0`). |
+| **⚙️ `--mode 55gb` + `--mtp off`** *(Standard `K=0` Baseline)* | `0.85 s` | `~1.1 – 1.8 s` *(short chat)* | **`14.31 tok/s`** (`69.9 ms/tok`) | **`~62 GB`** | Pure single-token autoregressive decoding without speculative MTP (`69.9 ms/token`). |
+| **⚡ `--mode 7gb` + `--mtp adaptive`** *(Low-RAM Default)* | `0.88 s` | `~1.1 – 1.7 s` *(short chat)* | **`13.06 – 14.60 tok/s`** (`68 – 76 ms/tok`) | **`~7.2 GB`** (+ OS Page Cache) | Zero-copy `mmap` on-demand expert routing. Leaves **`> 110 GB` RAM free** for other workloads. |
+| **💿 `--mode tierc` (All `384/384` Experts)** *(Full `404 GB` NVMe)* | `0.88 s` | `~10.6 s` *(cold NVMe)* | **`2.57 tok/s`** (`389 ms/tok`) | **`~62 GB`** + NVMe stream | Activates all `15,360` experts (`384/layer`) + `33 GB` Engram (`0` skips). Bottlenecked by NVMe SSD read bandwidth (`404 GB > 128 GB` RAM). |
+| **👁️ Multimodal Vision (`--image`)** *(32-Layer ViT + Aligner)* | `0.88 s` | `15.76 s` (`1,296` image patches) | **`8.85 tok/s`** (`113 ms/tok`) | **`~9.5 GB`** | Full `756×756` image encoding (`32`-layer `deepseek_v41_vision` ViT + projector) + text generation. |
+
+### Built-In Speculative MTP Benchmark (`./bin/flash1017-gx10-linux-arm64 bench -m ./DeepSeek-V4.1-Flash-1017-NVFP4 --mode 55gb`)
+
+```text
+Mode              Tok/s    ms/tok   Steps   Acc%     Tok/Step   Match K0
+----------------------------------------------------------------------------
+K=0 (Off)         14.31    69.9     64      0.0    % 1.00       ✅
+K=1               16.17    61.8     43      50.0   % 1.50       ✅
+K=2               14.79    67.6     36      39.3   % 1.79       ✅
+K=3               13.95    71.7     32      33.3   % 2.00       ✅
+Adaptive (1..3)   16.95    59.0     42      47.4   % 1.53       ✅
+```
 
 ---
 
