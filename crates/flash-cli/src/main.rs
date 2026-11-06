@@ -1,7 +1,7 @@
 use flash_core::{
-    hardware_addon, Flash1017HeadMode, Flash1017KvCache, Flash1017MtpMode, Flash1017Runtime,
-    Flash1017VerifiedMtpState, FLASH1017_BOS_TOKEN_ID, FLASH1017_EOS_TOKEN_ID,
-    FLASH1017_THINK_END_TOKEN_ID,
+    hardware_addon, Flash1017HeadMode, Flash1017Jepa106Compressor, Flash1017KvCache,
+    Flash1017MtpMode, Flash1017Runtime, Flash1017VerifiedMtpState, FLASH1017_BOS_TOKEN_ID,
+    FLASH1017_EOS_TOKEN_ID, FLASH1017_THINK_END_TOKEN_ID,
 };
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
@@ -1341,6 +1341,9 @@ ANVÄNDNING:
   3. Kör MTP-hastighetsbenchmark (K=0..4 + Adaptive):
      flash1017-gx10 bench -m <model_dir> --memory-mode <7gb|55gb|tierc>
 
+  4. Komprimera 404 GB NVFP4 -> 106 GB (1.58-Bit + 0.33 MB Rank-16 Q8 JEPA på alla 384 experter):
+     flash1017-gx10 compress-106gb -m <nvfp4_dir> -o <output_106gb_dir> [--layer <0..39>]
+
 FLAGGOR:
   -m, --model <sökväg>          Sökväg till DeepSeek-V4.1-Flash-1017-NVFP4 / Tier2
   --host <ip>                   Bind-adress för server (standard: 0.0.0.0)
@@ -1397,6 +1400,8 @@ fn main() {
     let mut default_params = SamplingParams::default();
     let mut load_engram = true;
     let mut api_key: Option<String> = None;
+    let mut output_dir: Option<PathBuf> = None;
+    let mut target_layer: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -1408,6 +1413,26 @@ fn main() {
             "bench" | "--bench" | "--bench-mtp" => {
                 subcmd = "bench".to_string();
                 i += 1;
+            }
+            "compress-106gb" | "--compress-106gb" => {
+                subcmd = "compress-106gb".to_string();
+                i += 1;
+            }
+            "-o" | "--output" | "--output-dir" => {
+                if let Some(v) = args.get(i + 1) {
+                    output_dir = Some(PathBuf::from(v));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--layer" | "-l" => {
+                if let Some(v) = args.get(i + 1) {
+                    target_layer = v.parse::<usize>().ok();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             "chat" => {
                 subcmd = "chat".to_string();
@@ -1650,6 +1675,103 @@ fn main() {
     println!("==========================================================================");
     if let Ok((name, backend, _path)) = hardware_addon::load_hardware_addon(&addon_spec) {
         println!("  • Hårdvara : {} ({})", name, backend);
+    }
+
+    if subcmd == "compress-106gb" {
+        let out_dir = output_dir.unwrap_or_else(|| {
+            model_dir
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("DeepSeek-V4.1-Flash-1017-106GB-JEPA")
+        });
+        let _ = std::fs::create_dir_all(&out_dir);
+        println!("  • Kompressor: 404 GB NVFP4 -> 106 GB (1.58-Bit + 0.33 MB Rank-16 Q8 JEPA)");
+        println!("  • Källa     : {}", model_dir.display());
+        println!("  • Mål       : {}", out_dir.display());
+        println!("==========================================================================\n");
+
+        let layers: Vec<usize> = if let Some(l) = target_layer {
+            vec![l]
+        } else {
+            // Symlink non-MoE files (`tokenizer.json`, `config.json`, `model-00001..2`, `model-00043..48`)
+            for name in [
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "generation_config.json",
+                "model-00001-of-00048.safetensors",
+                "model-00002-of-00048.safetensors",
+                "model-00043-of-00048.safetensors",
+                "model-00044-of-00048.safetensors",
+                "model-00045-of-00048.safetensors",
+                "model-00046-of-00048.safetensors",
+                "model-00047-of-00048.safetensors",
+                "model-00048-of-00048.safetensors",
+            ] {
+                let src = model_dir.join(name);
+                let dst = out_dir.join(name);
+                if src.exists() && !dst.exists() {
+                    #[cfg(unix)]
+                    {
+                        let _ = std::os::unix::fs::symlink(&src, &dst);
+                    }
+                }
+            }
+            (0..40).collect()
+        };
+
+        let t_all = Instant::now();
+        let mut total_orig: u64 = 0;
+        let mut total_comp: u64 = 0;
+        for l in layers {
+            let shard_name = format!("model-{:05}-of-00048.safetensors", l + 3);
+            let in_shard = model_dir.join(&shard_name);
+            let out_shard = out_dir.join(&shard_name);
+            if target_layer.is_none() && out_shard.exists() {
+                if let Ok(meta) = std::fs::metadata(&out_shard) {
+                    if meta.len() > 100_000_000 {
+                        println!(
+                            "  ⏭️  [Lager {:02}/39] {} finns redan ({:.2} GB) — hoppar över.",
+                            l,
+                            shard_name,
+                            meta.len() as f64 / 1e9
+                        );
+                        continue;
+                    }
+                }
+            }
+            print!(
+                "  ⚙️  [Lager {:02}/39] Komprimerar 384 experter i {} ... ",
+                l, shard_name
+            );
+            let _ = io::stdout().flush();
+            match Flash1017Jepa106Compressor::compress_layer_shard(&in_shard, &out_shard) {
+                Ok(rep) => {
+                    total_orig += rep.original_file_bytes;
+                    total_comp += rep.compressed_file_bytes;
+                    println!(
+                        "KLAR på {:.1}s! {:.2} GB -> {:.2} GB (-{:.1}%) | Frob-fel: 1.58b={:.4} -> JEPA-Q8={:.4}",
+                        rep.elapsed_secs,
+                        rep.original_file_bytes as f64 / 1e9,
+                        rep.compressed_file_bytes as f64 / 1e9,
+                        rep.savings_percent,
+                        rep.ternary_only_rel_frob_err,
+                        rep.jepa_recovered_rel_frob_err
+                    );
+                }
+                Err(e) => {
+                    eprintln!("\n❌ Fel vid komprimering av lager {}: {}", l, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        println!(
+            "\n✅ Komprimering klar på {:.1}s! Totalt: {:.2} GB -> {:.2} GB.",
+            t_all.elapsed().as_secs_f64(),
+            total_orig as f64 / 1e9,
+            total_comp as f64 / 1e9
+        );
+        return;
     }
 
     let t_open = Instant::now();

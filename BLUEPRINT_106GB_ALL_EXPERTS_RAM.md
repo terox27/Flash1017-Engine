@@ -104,8 +104,20 @@ Because `DeepSeek-V4.1-Flash-1017` ships natively as the `404 GB` [`nvidia/DeepS
 1. **If you already have `nvidia/DeepSeek-V4.1-Flash-1017-NVFP4` (`404 GB`) on disk:**
    - You can convert the 40 MoE layer shards **one shard at a time** (`model-00003-of-00048.safetensors` through `model-00042-of-00048.safetensors`, `~7.3 GB` -> `~2.6 GB` per shard).
    - Dequantize each expert's `NVFP4` weights (`FP4 E2M1` + `F8_E4M3` block scale + `FP32` global scale) to `FP32`, extract the `Rank-16 Q8` JEPA core (`0.33 MB`), pack the residual into `1.58-bit` ternary (`6.35 MB`), and upload the resulting `~106 GB` checkpoint to Hugging Face (under the mandatory open-sharing terms in [`LICENSE`](LICENSE))!
-2. **Engine Support Already Built In:**
-   - `Flash1017-Engine` already includes the native zero-copy `mmap` reader (`CachedTernary158Mat` + `CachedRank16Q8Core`), the runtime `JEPA` autopilot (`apply_jepa_inter_layer_noise_canceller` & `jepa_mtp_coherence_score`), and `t = 0.0 ms` `Engram` pre-lookup (`prefetch_engram_at_t0`).
+2. **Compressor & Runtime Engine Built In (`flash1017-gx10 compress-106gb`):**
+   - `Flash1017-Engine` includes both the native multi-core compressor (`Flash1017Jepa106Compressor`) and the zero-copy `mmap` reader (`CachedTernary158Mat` + `CachedRank16Q8Core`):
+   ```bash
+   # Test on a single layer shard (~15-20s on 20 ARM64 cores):
+   ./bin/flash1017-gx10-linux-arm64 compress-106gb \
+     -m /path/to/DeepSeek-V4.1-Flash-1017-NVFP4 \
+     -o /path/to/DeepSeek-V4.1-Flash-1017-106GB-JEPA \
+     --layer 0
+
+   # Compress all 40 MoE layers (resumable, auto-symlinks non-MoE shards):
+   ./bin/flash1017-gx10-linux-arm64 compress-106gb \
+     -m /path/to/DeepSeek-V4.1-Flash-1017-NVFP4 \
+     -o /path/to/DeepSeek-V4.1-Flash-1017-106GB-JEPA
+   ```
 
 
 ---

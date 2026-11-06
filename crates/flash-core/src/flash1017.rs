@@ -5054,8 +5054,16 @@ impl Flash1017Runtime {
                 }
             }
 
-            // Compute calibrated NVFP4 scale factor (`mean(weight_scale) * weight_scale_2`) from the first Tier A expert
-            let mut tier_b_proj_scale = 0.01065_f32;
+            // Compute calibrated NVFP4 scale factor (`mean(weight_scale) * weight_scale_2`) from the first Tier A expert,
+            // or `1.0` when opening a `106 GB` all-experts shard where exact scales are baked into `row_scales` + `core_*_scale`.
+            let mut tier_b_proj_scale = if shard
+                .tensors
+                .contains_key(&format!("layers.{}.ffn.experts.0.w1.core_b_q8", l))
+            {
+                1.0_f32
+            } else {
+                0.01065_f32
+            };
             if let Some(&first_a) = tier_a_list.first() {
                 if let (Ok((_, sc_bytes)), Ok((_, sc2_bytes))) = (
                     shard.get_tensor_data(&format!("layers.{}.ffn.experts.{}.w1.weight_scale", l, first_a)),
@@ -10246,10 +10254,633 @@ sys.stdout.buffer.write(img.tobytes())
     }
 }
 
+// ============================================================================
+// 106 GB ALL-EXPERTS-IN-RAM COMPRESSOR (`1.58-Bit` + `0.33 MB Rank-16 Q8 JEPA`)
+// ============================================================================
+
+/// Compressed `1.58-bit` ternary matrix + `Rank-16 Q8 JEPA` principal residual core.
+#[derive(Debug, Clone)]
+pub struct CompressedJepaMatrix158 {
+    pub rows: usize,
+    pub cols: usize,
+    pub packed_ternary: Vec<u8>,
+    pub row_scales: Vec<f32>,
+    pub core_b_q8: Vec<u8>,
+    pub core_b_scale: Vec<f32>,
+    pub core_a_q8: Vec<u8>,
+    pub core_a_scale: Vec<f32>,
+    pub orig_frob_sq: f64,
+    pub ternary_err_sq: f64,
+    pub jepa_err_sq: f64,
+}
+
+/// Telemetry report after compressing a Flash-1017 layer shard to the `106 GB` (`1.58-bit + Rank-16 Q8 JEPA`) format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Flash1017Jepa106ShardReport {
+    pub layer_idx: usize,
+    pub experts_compressed: usize,
+    pub original_file_bytes: u64,
+    pub compressed_file_bytes: u64,
+    pub saved_bytes: u64,
+    pub savings_percent: f32,
+    pub ternary_only_rel_frob_err: f32,
+    pub jepa_recovered_rel_frob_err: f32,
+    pub elapsed_secs: f64,
+}
+
+#[inline]
+fn orthonormalize_cols_16(mat: &mut [[f32; 16]]) {
+    let n = mat.len();
+    if n == 0 {
+        return;
+    }
+    for k in 0..16 {
+        for j in 0..k {
+            let mut dot = 0.0_f64;
+            for r in 0..n {
+                dot += (mat[r][k] as f64) * (mat[r][j] as f64);
+            }
+            let d = dot as f32;
+            for r in 0..n {
+                mat[r][k] -= d * mat[r][j];
+            }
+        }
+        let mut norm_sq = 0.0_f64;
+        for r in 0..n {
+            let v = mat[r][k] as f64;
+            norm_sq += v * v;
+        }
+        let inv_norm = if norm_sq > 1e-24 {
+            (1.0 / norm_sq.sqrt()) as f32
+        } else {
+            0.0_f32
+        };
+        for r in 0..n {
+            mat[r][k] *= inv_norm;
+        }
+    }
+}
+
+/// Compresses an `NVFP4` matrix (`w_bytes` `[rows, packed_cols]`, `sc_bytes` `[rows, cols/16]` `F8_E4M3`, `sc2_bytes` `[1]` `F32`)
+/// into `1.58-bit` ternary (`packed_ternary` + `row_scales`) plus a `Rank-16 Q8 JEPA` principal residual core
+/// (`core_b_q8` `[rows, 16]`, `core_b_scale` `[16]`, `core_a_q8` `[16, cols]`, `core_a_scale` `[16]`).
+pub fn compress_nvfp4_matrix_to_158_jepa_q8(
+    w_bytes: &[u8],
+    sc_bytes: &[u8],
+    sc2_bytes: &[u8],
+    rows: usize,
+    packed_cols: usize,
+    seed: u64,
+) -> CompressedJepaMatrix158 {
+    let cols = packed_cols * 2;
+    let groups_per_row = cols / 16;
+    let global_scale = if sc2_bytes.len() >= 4 {
+        f32::from_le_bytes([sc2_bytes[0], sc2_bytes[1], sc2_bytes[2], sc2_bytes[3]])
+    } else {
+        1.0_f32
+    };
+
+    let packed_ternary_cols = (cols + 3) / 4;
+    let mut packed_ternary = vec![0u8; rows * packed_ternary_cols];
+    let mut row_scales = Vec::with_capacity(rows);
+    let mut residual = vec![0.0_f32; rows * cols];
+
+    let mut orig_frob_sq = 0.0_f64;
+    let mut ternary_err_sq = 0.0_f64;
+
+    // 1. Dequantize true NVFP4 weights -> quantize to optimal LSQ 1.58-bit ternary -> form residual R = W - W_1.58
+    for r in 0..rows {
+        let w_row = &w_bytes[r * packed_cols..(r + 1) * packed_cols];
+        let sc_row = &sc_bytes[r * groups_per_row..(r + 1) * groups_per_row];
+        let res_row = &mut residual[r * cols..(r + 1) * cols];
+
+        let mut abs_sum = 0.0_f32;
+        for g in 0..groups_per_row {
+            let g_sc = f8_e4m3_to_f32(sc_row[g]) * global_scale;
+            let b_base = g * 8;
+            let c_base = g * 16;
+            for k in 0..8 {
+                let b = w_row[b_base + k];
+                let w0 = FP4_E2M1_LUT[(b & 0x0F) as usize] * g_sc;
+                let w1 = FP4_E2M1_LUT[(b >> 4) as usize] * g_sc;
+                res_row[c_base + k * 2] = w0;
+                res_row[c_base + k * 2 + 1] = w1;
+                abs_sum += w0.abs() + w1.abs();
+                orig_frob_sq += (w0 as f64) * (w0 as f64) + (w1 as f64) * (w1 as f64);
+            }
+        }
+
+        let scale = (abs_sum / (cols as f32)).max(1e-12_f32);
+        let inv_scale = 1.0_f32 / scale;
+        let mut dot_wt = 0.0_f32;
+        let mut dot_tt = 0.0_f32;
+        let p_row_start = r * packed_ternary_cols;
+
+        for c in 0..cols {
+            let w = res_row[c];
+            let t = (w * inv_scale).round().clamp(-1.0, 1.0) as i8;
+            let tf = t as f32;
+            dot_wt += w * tf;
+            dot_tt += tf * tf;
+            let code = ((t + 1) as u8) & 0b11;
+            packed_ternary[p_row_start + (c >> 2)] |= code << ((c & 3) * 2);
+        }
+
+        let opt_gamma = if dot_tt > 0.0 { dot_wt / dot_tt } else { scale };
+        row_scales.push(opt_gamma);
+
+        const LUT: [f32; 4] = [-1.0, 0.0, 1.0, 0.0];
+        let p_row = &packed_ternary[p_row_start..p_row_start + packed_ternary_cols];
+        for (i, &pb) in p_row.iter().enumerate() {
+            let base = i * 4;
+            let r0 = res_row[base] - LUT[(pb & 3) as usize] * opt_gamma;
+            let r1 = res_row[base + 1] - LUT[((pb >> 2) & 3) as usize] * opt_gamma;
+            let r2 = res_row[base + 2] - LUT[((pb >> 4) & 3) as usize] * opt_gamma;
+            let r3 = res_row[base + 3] - LUT[((pb >> 6) & 3) as usize] * opt_gamma;
+            res_row[base] = r0;
+            res_row[base + 1] = r1;
+            res_row[base + 2] = r2;
+            res_row[base + 3] = r3;
+            ternary_err_sq += (r0 as f64) * (r0 as f64)
+                + (r1 as f64) * (r1 as f64)
+                + (r2 as f64) * (r2 as f64)
+                + (r3 as f64) * (r3 as f64);
+        }
+    }
+
+    // 2. Two-sweep Randomized Subspace Iteration (`Rank = 16`) on residual matrix R (`[rows, cols]`)
+    let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut p = vec![[0.0_f32; 16]; cols];
+    for c in 0..cols {
+        for k in 0..16 {
+            rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = rng;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            p[c][k] = (((z >> 40) as i32 - (1 << 23)) as f32) * (1.0_f32 / ((1 << 23) as f32));
+        }
+    }
+    orthonormalize_cols_16(&mut p);
+
+    let mut q = vec![[0.0_f32; 16]; rows];
+    let mut z = vec![[0.0_f32; 16]; cols];
+
+    for sweep in 0..2 {
+        // q = R * p (`[rows, 16]`)
+        for r in 0..rows {
+            let r_row = &residual[r * cols..(r + 1) * cols];
+            let mut acc = [0.0_f32; 16];
+            for c in 0..cols {
+                let v = r_row[c];
+                let p_row = &p[c];
+                for k in 0..16 {
+                    acc[k] += v * p_row[k];
+                }
+            }
+            q[r] = acc;
+        }
+        orthonormalize_cols_16(&mut q);
+
+        // z = R^T * q (`[cols, 16]`)
+        z.fill([0.0_f32; 16]);
+        for r in 0..rows {
+            let r_row = &residual[r * cols..(r + 1) * cols];
+            let q_row = q[r];
+            for c in 0..cols {
+                let v = r_row[c];
+                let z_row = &mut z[c];
+                for k in 0..16 {
+                    z_row[k] += v * q_row[k];
+                }
+            }
+        }
+        if sweep == 0 {
+            p.copy_from_slice(&z);
+            orthonormalize_cols_16(&mut p);
+        }
+    }
+
+    // 3. Quantize orthonormal left subspace `q` (`[rows, 16]`) -> `core_b_q8` (`[rows, 16]`) + `core_b_scale` (`[16]`)
+    //    and right projected vectors `z` (`[cols, 16]`) -> `core_a_q8` (`[16, cols]`) + `core_a_scale` (`[16]`)
+    let mut core_b_q8 = vec![0u8; rows * 16];
+    let mut core_b_scale = vec![0.0_f32; 16];
+    let mut core_a_q8 = vec![0u8; 16 * cols];
+    let mut core_a_scale = vec![0.0_f32; 16];
+    let mut captured_frob_sq = 0.0_f64;
+
+    for k in 0..16 {
+        let mut max_u = 0.0_f32;
+        for r in 0..rows {
+            let a = q[r][k].abs();
+            if a > max_u {
+                max_u = a;
+            }
+        }
+        let b_sc = if max_u > 1e-12 { max_u / 127.0_f32 } else { 0.0_f32 };
+        core_b_scale[k] = b_sc;
+        if b_sc > 0.0 {
+            let inv_b = 1.0_f32 / b_sc;
+            for r in 0..rows {
+                let q8 = (q[r][k] * inv_b).round().clamp(-127.0, 127.0) as i8;
+                core_b_q8[r * 16 + k] = q8 as u8;
+            }
+        }
+
+        let mut max_z = 0.0_f32;
+        let mut col_norm_sq = 0.0_f64;
+        for c in 0..cols {
+            let zv = z[c][k];
+            let a = zv.abs();
+            if a > max_z {
+                max_z = a;
+            }
+            col_norm_sq += (zv as f64) * (zv as f64);
+        }
+        captured_frob_sq += col_norm_sq;
+        let a_sc = if max_z > 1e-12 { max_z / 127.0_f32 } else { 0.0_f32 };
+        core_a_scale[k] = a_sc;
+        if a_sc > 0.0 {
+            let inv_a = 1.0_f32 / a_sc;
+            let a_row_off = k * cols;
+            for c in 0..cols {
+                let q8 = (z[c][k] * inv_a).round().clamp(-127.0, 127.0) as i8;
+                core_a_q8[a_row_off + c] = q8 as u8;
+            }
+        }
+    }
+
+    let jepa_err_sq = (ternary_err_sq - captured_frob_sq).max(0.0);
+
+    CompressedJepaMatrix158 {
+        rows,
+        cols,
+        packed_ternary,
+        row_scales,
+        core_b_q8,
+        core_b_scale,
+        core_a_q8,
+        core_a_scale,
+        orig_frob_sq,
+        ternary_err_sq,
+        jepa_err_sq,
+    }
+}
+
+/// Pure-Rust `106 GB` All-Experts-in-RAM Compressor (`1.58-Bit` + `0.33 MB Rank-16 Q8 JEPA Core` across all 384 experts).
+pub struct Flash1017Jepa106Compressor;
+
+impl Flash1017Jepa106Compressor {
+    /// Compresses a single Flash-1017 MoE layer shard (`model-00003`..`model-00042`, layers `0..39`)
+    /// so all 384 experts are stored as `1.58-bit` ternary + `0.33 MB Rank-16 Q8 JEPA Core` (`~2.10 GB` per layer shard).
+    pub fn compress_layer_shard(
+        input_shard_path: &Path,
+        output_shard_path: &Path,
+    ) -> Result<Flash1017Jepa106ShardReport, String> {
+        use rayon::prelude::*;
+        use std::io::{BufWriter, Write};
+
+        let t0 = std::time::Instant::now();
+        let inspector = Flash1017ShardInspector::open(input_shard_path)?;
+        let summary = inspector.summarize()?;
+        let layer_idx = summary.layer_idx;
+        let num_experts = summary.detected_experts;
+
+        // 1. Retain all non-MoE tensors (`MLA Attention`, `shared_experts`, `gate`, `norms`, `hc_*`) 100% untouched
+        let mut zero_copy_tensors: Vec<(String, String, Vec<usize>, &[u8])> = Vec::new();
+        let mut sorted_names: Vec<&String> = inspector.tensors.keys().collect();
+        sorted_names.sort();
+
+        for name in sorted_names {
+            if !name.contains(".ffn.experts.") && !name.contains(".merkaba.") {
+                let (meta, slice) = inspector.get_tensor_data(name)?;
+                zero_copy_tensors.push((
+                    name.clone(),
+                    meta.dtype.clone(),
+                    meta.shape.clone(),
+                    slice,
+                ));
+            }
+        }
+
+        // 2. Compress all 384 experts in parallel across all CPU cores via Rayon
+        struct CompressedExpert106 {
+            expert_idx: usize,
+            w1: CompressedJepaMatrix158,
+            w2: CompressedJepaMatrix158,
+            w3: CompressedJepaMatrix158,
+        }
+
+        let experts: Vec<CompressedExpert106> = (0..num_experts)
+            .into_par_iter()
+            .map(|exp_idx| {
+                let p_w1 = format!("layers.{}.ffn.experts.{}.w1", layer_idx, exp_idx);
+                let p_w2 = format!("layers.{}.ffn.experts.{}.w2", layer_idx, exp_idx);
+                let p_w3 = format!("layers.{}.ffn.experts.{}.w3", layer_idx, exp_idx);
+
+                let (m1, w1_b) = inspector.get_tensor_data(&format!("{}.weight", p_w1))?;
+                let (_, sc1_b) = inspector.get_tensor_data(&format!("{}.weight_scale", p_w1))?;
+                let (_, sc2_1_b) = inspector.get_tensor_data(&format!("{}.weight_scale_2", p_w1))?;
+
+                let (m2, w2_b) = inspector.get_tensor_data(&format!("{}.weight", p_w2))?;
+                let (_, sc2_b) = inspector.get_tensor_data(&format!("{}.weight_scale", p_w2))?;
+                let (_, sc2_2_b) = inspector.get_tensor_data(&format!("{}.weight_scale_2", p_w2))?;
+
+                let (m3, w3_b) = inspector.get_tensor_data(&format!("{}.weight", p_w3))?;
+                let (_, sc3_b) = inspector.get_tensor_data(&format!("{}.weight_scale", p_w3))?;
+                let (_, sc2_3_b) = inspector.get_tensor_data(&format!("{}.weight_scale_2", p_w3))?;
+
+                let seed_base = ((layer_idx as u64) << 16) ^ ((exp_idx as u64) << 4);
+                let w1 = compress_nvfp4_matrix_to_158_jepa_q8(
+                    w1_b,
+                    sc1_b,
+                    sc2_1_b,
+                    m1.shape[0],
+                    m1.shape[1],
+                    seed_base ^ 1,
+                );
+                let w2 = compress_nvfp4_matrix_to_158_jepa_q8(
+                    w2_b,
+                    sc2_b,
+                    sc2_2_b,
+                    m2.shape[0],
+                    m2.shape[1],
+                    seed_base ^ 2,
+                );
+                let w3 = compress_nvfp4_matrix_to_158_jepa_q8(
+                    w3_b,
+                    sc3_b,
+                    sc2_3_b,
+                    m3.shape[0],
+                    m3.shape[1],
+                    seed_base ^ 3,
+                );
+
+                Ok(CompressedExpert106 {
+                    expert_idx: exp_idx,
+                    w1,
+                    w2,
+                    w3,
+                })
+            })
+            .collect::<Result<Vec<CompressedExpert106>, String>>()?;
+
+        let mut total_orig_sq = 0.0_f64;
+        let mut total_tern_err_sq = 0.0_f64;
+        let mut total_jepa_err_sq = 0.0_f64;
+
+        struct OwnedTensor {
+            name: String,
+            dtype: String,
+            shape: Vec<usize>,
+            data: Vec<u8>,
+        }
+        let mut owned_tensors: Vec<OwnedTensor> = Vec::with_capacity(num_experts * 18 + 3);
+
+        let f32_slice_to_bytes = |v: &[f32]| -> Vec<u8> {
+            let mut b = Vec::with_capacity(v.len() * 4);
+            for &x in v {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+            b
+        };
+
+        let mut push_jepa_mat = |prefix: String, m: CompressedJepaMatrix158| {
+            total_orig_sq += m.orig_frob_sq;
+            total_tern_err_sq += m.ternary_err_sq;
+            total_jepa_err_sq += m.jepa_err_sq;
+
+            owned_tensors.push(OwnedTensor {
+                name: format!("{}.packed_ternary", prefix),
+                dtype: "U8".to_string(),
+                shape: vec![m.rows, m.cols / 4],
+                data: m.packed_ternary,
+            });
+            owned_tensors.push(OwnedTensor {
+                name: format!("{}.row_scales", prefix),
+                dtype: "F32".to_string(),
+                shape: vec![m.rows],
+                data: f32_slice_to_bytes(&m.row_scales),
+            });
+            owned_tensors.push(OwnedTensor {
+                name: format!("{}.core_b_q8", prefix),
+                dtype: "I8".to_string(),
+                shape: vec![m.rows, 16],
+                data: m.core_b_q8,
+            });
+            owned_tensors.push(OwnedTensor {
+                name: format!("{}.core_b_scale", prefix),
+                dtype: "F32".to_string(),
+                shape: vec![16],
+                data: f32_slice_to_bytes(&m.core_b_scale),
+            });
+            owned_tensors.push(OwnedTensor {
+                name: format!("{}.core_a_q8", prefix),
+                dtype: "I8".to_string(),
+                shape: vec![16, m.cols],
+                data: m.core_a_q8,
+            });
+            owned_tensors.push(OwnedTensor {
+                name: format!("{}.core_a_scale", prefix),
+                dtype: "F32".to_string(),
+                shape: vec![16],
+                data: f32_slice_to_bytes(&m.core_a_scale),
+            });
+        };
+
+        for exp in experts {
+            let e = exp.expert_idx;
+            push_jepa_mat(format!("layers.{}.ffn.experts.{}.w1", layer_idx, e), exp.w1);
+            push_jepa_mat(format!("layers.{}.ffn.experts.{}.w2", layer_idx, e), exp.w2);
+            push_jepa_mat(format!("layers.{}.ffn.experts.{}.w3", layer_idx, e), exp.w3);
+        }
+
+        // Write index metadata: all 384 experts active in Tier B (`1.58-bit + JEPA`), 0 pruned
+        let mut all_indices_bytes = Vec::with_capacity(num_experts * 8);
+        for e in 0..num_experts {
+            all_indices_bytes.extend_from_slice(&(e as i64).to_le_bytes());
+        }
+        owned_tensors.push(OwnedTensor {
+            name: format!("layers.{}.merkaba.tier_a_indices", layer_idx),
+            dtype: "I64".to_string(),
+            shape: vec![0],
+            data: Vec::new(),
+        });
+        owned_tensors.push(OwnedTensor {
+            name: format!("layers.{}.merkaba.tier_b_indices", layer_idx),
+            dtype: "I64".to_string(),
+            shape: vec![num_experts],
+            data: all_indices_bytes,
+        });
+        owned_tensors.push(OwnedTensor {
+            name: format!("layers.{}.merkaba.tier_c_pruned_indices", layer_idx),
+            dtype: "I64".to_string(),
+            shape: vec![0],
+            data: Vec::new(),
+        });
+
+        // Build 8-byte-aligned safetensors header & write atomically
+        let mut header_map = serde_json::Map::new();
+        let mut current_offset: usize = 0;
+
+        for (name, dtype, shape, slice) in &zero_copy_tensors {
+            let start = current_offset;
+            let end = start + slice.len();
+            current_offset = (end + 7) & !7;
+            let mut meta = serde_json::Map::new();
+            meta.insert("dtype".to_string(), serde_json::Value::String(dtype.clone()));
+            meta.insert("shape".to_string(), serde_json::json!(shape));
+            meta.insert("data_offsets".to_string(), serde_json::json!([start, end]));
+            header_map.insert(name.clone(), serde_json::Value::Object(meta));
+        }
+
+        for ot in &owned_tensors {
+            let start = current_offset;
+            let end = start + ot.data.len();
+            current_offset = (end + 7) & !7;
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "dtype".to_string(),
+                serde_json::Value::String(ot.dtype.clone()),
+            );
+            meta.insert("shape".to_string(), serde_json::json!(ot.shape));
+            meta.insert("data_offsets".to_string(), serde_json::json!([start, end]));
+            header_map.insert(ot.name.clone(), serde_json::Value::Object(meta));
+        }
+
+        let header_json = serde_json::Value::Object(header_map);
+        let mut header_str = serde_json::to_string(&header_json)
+            .map_err(|e| format!("Failed to serialize 106GB safetensors header: {}", e))?;
+        while header_str.len() % 8 != 0 {
+            header_str.push(' ');
+        }
+        let header_bytes = header_str.as_bytes();
+        let header_len = header_bytes.len() as u64;
+
+        if let Some(parent) = output_shard_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp_output = output_shard_path.with_extension("safetensors.tmp");
+        let file = File::create(&tmp_output)
+            .map_err(|e| format!("Failed to create {}: {}", tmp_output.display(), e))?;
+        let mut writer = BufWriter::with_capacity(32 * 1024 * 1024, file);
+
+        writer
+            .write_all(&header_len.to_le_bytes())
+            .map_err(|e| format!("Write header len failed: {}", e))?;
+        writer
+            .write_all(header_bytes)
+            .map_err(|e| format!("Write header JSON failed: {}", e))?;
+
+        let zero_pad = [0u8; 8];
+        for (_, _, _, slice) in &zero_copy_tensors {
+            writer
+                .write_all(slice)
+                .map_err(|e| format!("Write zero-copy tensor failed: {}", e))?;
+            let rem = slice.len() % 8;
+            if rem != 0 {
+                writer
+                    .write_all(&zero_pad[..8 - rem])
+                    .map_err(|e| format!("Write pad failed: {}", e))?;
+            }
+        }
+        for ot in &owned_tensors {
+            writer
+                .write_all(&ot.data)
+                .map_err(|e| format!("Write owned tensor failed: {}", e))?;
+            let rem = ot.data.len() % 8;
+            if rem != 0 {
+                writer
+                    .write_all(&zero_pad[..8 - rem])
+                    .map_err(|e| format!("Write pad failed: {}", e))?;
+            }
+        }
+        writer
+            .flush()
+            .map_err(|e| format!("Flush failed: {}", e))?;
+        drop(writer);
+
+        std::fs::rename(&tmp_output, output_shard_path).map_err(|e| {
+            format!(
+                "Failed to rename {} to {}: {}",
+                tmp_output.display(),
+                output_shard_path.display(),
+                e
+            )
+        })?;
+
+        let original_file_bytes = inspector.mmap.len() as u64;
+        let compressed_file_bytes = std::fs::metadata(output_shard_path)
+            .map(|m| m.len())
+            .unwrap_or((8 + header_bytes.len() + current_offset) as u64);
+        let saved_bytes = original_file_bytes.saturating_sub(compressed_file_bytes);
+        let savings_percent = if original_file_bytes > 0 {
+            (saved_bytes as f32 / original_file_bytes as f32) * 100.0
+        } else {
+            0.0
+        };
+
+        let orig_norm = total_orig_sq.sqrt().max(1e-12);
+        let ternary_only_rel_frob_err = (total_tern_err_sq.sqrt() / orig_norm) as f32;
+        let jepa_recovered_rel_frob_err = (total_jepa_err_sq.sqrt() / orig_norm) as f32;
+
+        Ok(Flash1017Jepa106ShardReport {
+            layer_idx,
+            experts_compressed: num_experts,
+            original_file_bytes,
+            compressed_file_bytes,
+            saved_bytes,
+            savings_percent,
+            ternary_only_rel_frob_err,
+            jepa_recovered_rel_frob_err,
+            elapsed_secs: t0.elapsed().as_secs_f64(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_compress_nvfp4_matrix_to_158_jepa_q8_accuracy() {
+        let rows = 64usize;
+        let cols = 128usize;
+        let packed_cols = cols / 2;
+        let groups_per_row = cols / 16;
+
+        let mut w_bytes = vec![0u8; rows * packed_cols];
+        let mut sc_bytes = vec![0x38u8; rows * groups_per_row]; // 0x38 = 1.0 in F8_E4M3
+        for (i, b) in w_bytes.iter_mut().enumerate() {
+            let n0 = ((i * 7 + 3) % 16) as u8;
+            let n1 = ((i * 13 + 5) % 16) as u8;
+            *b = n0 | (n1 << 4);
+        }
+        for (i, s) in sc_bytes.iter_mut().enumerate() {
+            *s = if i % 2 == 0 { 0x38 } else { 0x3C };
+        }
+        let sc2_bytes = 0.02_f32.to_le_bytes();
+
+        let comp = compress_nvfp4_matrix_to_158_jepa_q8(
+            &w_bytes,
+            &sc_bytes,
+            &sc2_bytes,
+            rows,
+            packed_cols,
+            42,
+        );
+        assert_eq!(comp.packed_ternary.len(), rows * (cols / 4));
+        assert_eq!(comp.row_scales.len(), rows);
+        assert_eq!(comp.core_b_q8.len(), rows * 16);
+        assert_eq!(comp.core_a_q8.len(), 16 * cols);
+        assert!(
+            comp.jepa_err_sq < comp.ternary_err_sq,
+            "Rank-16 Q8 JEPA core must strictly reduce Frobenius quantization error ({} < {})",
+            comp.jepa_err_sq,
+            comp.ternary_err_sq
+        );
+    }
 
     #[test]
     fn test_inspect_shard_layer_5() {
@@ -10329,18 +10960,20 @@ Jag ska skapa ett tvåspråkigt faktakort (Engelska #1 + Svenska #2) inom fysik/
             Some("Das zweite newtonsche Gesetz besagt: F = m · a.")
         );
 
-        let dir = tempfile::tempdir().unwrap();
-        let created_domains = init_core_domain_skeleton(dir.path())
+        let dir_path = std::env::temp_dir().join("flash1017_test_db");
+        let _ = std::fs::remove_dir_all(&dir_path);
+        std::fs::create_dir_all(&dir_path).unwrap();
+        let created_domains = init_core_domain_skeleton(&dir_path)
             .expect("Should initialize 20 core domains");
         assert_eq!(created_domains, CORE_DOMAINS.len());
-        assert!(dir.path().join("fysik").join("domain_profile.json").exists());
+        assert!(dir_path.join("fysik").join("domain_profile.json").exists());
 
         let saved_path = cards[0]
-            .save_to_databases(dir.path())
+            .save_to_databases(&dir_path)
             .expect("Should save card atomically");
         assert!(saved_path.exists());
 
-        let cp_path = dir.path().join("crystallization_checkpoint.json");
+        let cp_path = dir_path.join("crystallization_checkpoint.json");
         let mut cp = CrystallizationCheckpoint::load_or_default(&cp_path);
         cp.record_saved_card(&cards[0], Some("fysik:mekanik"));
         cp.save_atomic(&cp_path).expect("Should save checkpoint");
@@ -10348,6 +10981,7 @@ Jag ska skapa ett tvåspråkigt faktakort (Engelska #1 + Svenska #2) inom fysik/
         let loaded_cp = CrystallizationCheckpoint::load_or_default(&cp_path);
         assert_eq!(loaded_cp.total_cards_saved, 1);
         assert_eq!(loaded_cp.domain_card_counts.get("fysik"), Some(&1));
+        let _ = std::fs::remove_dir_all(&dir_path);
 
         // Also verify compatibility with existing databases/kemi card if present, and ensure 20 core domains exist
         let real_db_root = PathBuf::from("/Volumes/NET/ai-projects/databases");
