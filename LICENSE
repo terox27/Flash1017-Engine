@@ -1,0 +1,58 @@
+# MERKABA SOURCE-AVAILABLE & MANDATORY SHARE-ALIKE LICENSE v1.1
+## (`€1,000 EUR / $1,000 USD Monthly Commercial Threshold — Engine, Kernels & Container Format`)
+
+**Copyright (c) 2026 Tommy (`terox27`) — Merkaba01 & Flash1017-Engine Project (https://terox27.github.io/)**  
+**All Rights Reserved, except as explicitly granted below.**
+
+Permission to view, compile, modify, and use the source code, binaries, PTX/CUDA/CPU compute kernels, runtime algorithms, tensor container formats, and architectural blueprints in this repository (`Flash1017-Engine` and `BLUEPRINT_106GB_ALL_EXPERTS_RAM.md`, collectively the **"Software, Format, and Blueprint"**) is granted subject to the following strict conditions:
+
+---
+
+### 1. Free Non-Commercial & Hobbyist Use (`<= €1,000 EUR / $1,000 USD per Month`)
+Individuals, students, hobbyists, and non-profit academic researchers whose total gross revenue, funding, salary, or commercial cost savings derived from or in connection with the use of the Software, Format, and Blueprint is **at most `€1,000 EUR` (One Thousand Euros, approximately `$1,000 USD` / `10,000 SEK`) per calendar month** may view, compile, run, and experiment with the Software, Format, and Blueprint **free of charge**.
+
+---
+
+### 2. Mandatory Paid Commercial License (`> €1,000 EUR / $1,000 USD per Month` — Including Cloud, API & Internal Business Use)
+Any individual, consultant, company, startup, corporation, cloud service provider, or hardware vendor that:
+1. Generates or saves more than **`€1,000 EUR` (`~$1,000 USD` / `10,000 SEK`) per month** in gross revenue, service fees, consulting income, funding, or infrastructure/hardware cost savings in connection with the Software, Format, and Blueprint, **OR**
+2. Uses the Software, its binaries (`flash1017-gx10`, `addon_gx10_rust.so`), its `t = 0 ms` `Engram` pre-lookup, its `JEPA` runtime autopilot, its `CPU Lookahead`, or its `1.58-bit + Rank-16 Q8 JEPA` container format in **any business, enterprise, commercial product, hosted API / SaaS / cloud service, customer-facing service, or internal company workflow**,
+
+**MUST obtain a paid commercial license from the Copyright Holder (`terox27` via https://github.com/terox27 or https://terox27.github.io/) prior to such use.** Unauthorized commercial or internal enterprise use above the `€1,000 EUR / $1,000 USD per month` threshold is a direct violation of copyright law.
+
+---
+
+### 3. Two-Layer Separation (`Engine & Format` vs. `Base Model Weights`) & Mandatory Open Sharing of Compressed Weights (`All Models`)
+1. **Separation from Third-Party Base Model Licenses:**  
+   This License governs **exclusively the Software, Runtime Engine, Compute Kernels, and Tensor Container Format (`.packed_ternary`, `.row_scales`, `.jepa_u_q8`, `.jepa_v_q8`, and sidecar formats)**. Underlying third-party base model weights (such as those from DeepSeek-AI, NVIDIA, Meta, Google, Alibaba/Qwen, or Mistral) remain subject to their respective original model licenses. Obtaining a license from a base model creator does **not** grant any right to use this Software, Engine, or Container Format commercially without a paid commercial license from `terox27`.
+2. **Mandatory Open Weight Sharing (`Share-Alike Across ALL Models of Any Size or Architecture`):**  
+   Anyone who uses the Software or Blueprint under the free non-commercial tier (Section 1) to produce quantized, compressed, or SVD/JEPA-healed model weights — **for ANY model of ANY parameter size, byte footprint (`12 GB`, `106 GB`, `300 GB`, etc.), or architecture (Mixture-of-Experts, Dense, Vision, Multimodal, etc.)** — **MUST**:
+   - **Share the resulting compressed model weights publicly and free of charge** (e.g., on Hugging Face) for the benefit of the community without paywalls, **AND**
+   - Include prominent attribution linking back to **`https://github.com/terox27/Flash1017-Engine`** and **`https://terox27.github.io/`**.
+3. **Models With Restrictive / Commercial Base Licenses or Private Weights:**  
+   If an underlying base model's license prohibits public redistribution of derivative/compressed weights, or if a user or organization wishes to keep the compressed weights private/proprietary, the free non-commercial grant in Section 1 **does not apply**, and a **paid commercial license must be obtained from the Copyright Holder (`terox27`)** prior to compressing or running such weights.
+
+---
+
+### 4. Ports to Other Hardware, Languages, Engines & Model Architectures (`Anti-Circumvention, AI-Cloning Prohibition & Upstream Grant`)
+Any translation, adaptation, re-implementation, automated/AI-assisted code translation, or port of the Software, its GPU/CPU compute kernels, or the [`BLUEPRINT_106GB_ALL_EXPERTS_RAM.md`](BLUEPRINT_106GB_ALL_EXPERTS_RAM.md) architecture to:
+1. **Other Hardware Architectures** (including but not limited to Apple Silicon `Metal` / `AMX`, AMD `ROCm` / `Strix Halo` / `RDNA`, NVIDIA discrete GPUs `RTX 3090 / 4090 / 5090` / `Blackwell` / `Hopper`, `x86_64 AVX2 / AVX-512 / AMX`, `ARM64 NEON / SVE`, `Vulkan`, `WebGPU`, or NPUs),
+2. **Other Programming Languages or Inference Engines** (including but not limited to `C`, `C++`, `CUDA C++`, `Python`, `Mojo`, `Zig`, `llama.cpp`, `GGUF`, `MLX`, `vLLM`, `SGLang`, `ExLlama`, or `TensorRT-LLM`), **OR**
+3. **Other Model Architectures** (including but not limited to `DeepSeek-V3 / R1`, `Qwen`, `Llama`, `Gemma`, `Mixtral`, or any other Mixture-of-Experts, Dense, or `Engram` models),
+
+constitutes a **Derivative Work** governed by this License:
+- **Commercial Threshold Inheritance:** The `€1,000 EUR / $1,000 USD per month` commercial licensing requirement in **Section 2** applies in full to all such ports, translations, and adaptations (including automated/AI-transpiled rewrites).
+- **Mandatory Open Source & Upstream Grant-Back:** Any non-commercial port or adaptation must be published openly under this exact License, and the contributor automatically grants the Copyright Holder (`terox27` / `Merkaba01`) a perpetual, worldwide, irrevocable, royalty-free right to integrate, re-license, and distribute that port across `Flash1017-Engine` and `Merkaba01`.
+
+---
+
+### 5. Mandatory Attribution & Defensive Patent / Litigation Termination
+1. **Attribution:** All copies, forks, ports, modified versions, benchmarks, blog posts, videos, and model cards using or referencing the Software, Format, or Blueprint must retain this `LICENSE` file, the [`CREDITS.md`](CREDITS.md) file, and visible attribution to **`terox27` (`Flash1017-Engine` / `Merkaba01`)**.
+2. **Defensive Termination:** If any user or entity files a patent claim, copyright claim, or lawsuit against the Copyright Holder (`terox27`) or attempts to patent any mechanism described in the Software or Blueprint, all rights granted to that user or entity under this License terminate immediately and retroactively.
+
+---
+
+### 6. Governing Law, Jurisdiction & Disclaimer of Warranty
+This License shall be governed by and construed in accordance with the **laws of Sweden** (including the Swedish Copyright Act, *Upphovsrättslagen 1960:729*), with exclusive jurisdiction in Swedish courts.
+
+THE SOFTWARE, FORMAT, AND BLUEPRINT ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE, FORMAT, OR BLUEPRINT OR THE USE OR OTHER DEALINGS IN THE SOFTWARE, FORMAT, OR BLUEPRINT.

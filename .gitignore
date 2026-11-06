@@ -1,15 +1,6 @@
 # ==========================================================================
-# 🔒 FLASH1017-ENGINE — STRICT CLOSED-SOURCE GITIGNORE (GB10 LOCKED EDITION)
+# ⚡ FLASH1017-ENGINE — OPEN-SOURCE RUST WORKSPACE GITIGNORE
 # ==========================================================================
-# All Rust source code (*.rs), Cargo manifests, and build artifacts are
-# strictly excluded from version control and public distribution.
-# Only stripped, hardware-locked binaries in `bin/` and `README.md` are allowed.
-
-*.rs
-*.sh
-Cargo.toml
-Cargo.lock
-crates/
 target/
 *.pdb
 *.dSYM/

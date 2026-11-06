@@ -1,0 +1,15 @@
+[package]
+name = "flash-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flash1017-gx10"
+path = "src/main.rs"
+
+[dependencies]
+flash-core = { path = "../flash-core" }
+serde.workspace = true
+serde_json.workspace = true

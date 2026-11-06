@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/flash-core",
+    "crates/flash-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Terox27"]
+license = "LicenseRef-Merkaba-Source-Available-1000EUR"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+memmap2 = "0.9"
+rayon = "1.10"
+half = "2.4"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
