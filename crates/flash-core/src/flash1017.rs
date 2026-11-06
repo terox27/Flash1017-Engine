@@ -2481,6 +2481,8 @@ pub struct CachedTernary158Mat {
     pub p_len: usize,
     pub s_ptr: *const u8,
     pub s_len: usize,
+    pub bs_ptr: *const u8,
+    pub bs_len: usize,
     pub rows: usize,
     pub cols: usize,
     pub jepa_core: Option<CachedRank16Q8Core>,
@@ -2493,6 +2495,10 @@ impl CachedTernary158Mat {
     pub fn from_shard(shard: &Flash1017ShardInspector, prefix: &str) -> Result<Self, String> {
         let (p_meta, p_bytes) = shard.get_tensor_data(&format!("{}.packed_ternary", prefix))?;
         let (_s_meta, s_bytes) = shard.get_tensor_data(&format!("{}.row_scales", prefix))?;
+        let (bs_ptr, bs_len) = match shard.get_tensor_data(&format!("{}.block_scales", prefix)) {
+            Ok((_bm, b_slice)) => (b_slice.as_ptr(), b_slice.len()),
+            Err(_) => (std::ptr::null(), 0),
+        };
         let (s_ptr, _aligned_scales) = if (s_bytes.as_ptr() as usize) % 4 == 0 {
             (s_bytes.as_ptr(), None)
         } else {
@@ -2519,6 +2525,8 @@ impl CachedTernary158Mat {
             p_len: p_bytes.len(),
             s_ptr,
             s_len: s_bytes.len(),
+            bs_ptr,
+            bs_len,
             rows,
             cols,
             jepa_core,
@@ -2529,24 +2537,26 @@ impl CachedTernary158Mat {
     #[inline]
     pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
         use rayon::prelude::*;
-        if let Some(vt) = crate::hardware_addon::active_vtable() {
-            if let Some(mv) = vt.v3_matvec_ternary_158() {
-                if (self.s_ptr as usize) % 4 == 0 {
-                    let mut out = vec![0.0_f32; self.rows];
-                    unsafe {
-                        mv(
-                            self.rows,
-                            self.cols,
-                            self.p_ptr,
-                            self.s_ptr as *const f32,
-                            x.as_ptr(),
-                            out.as_mut_ptr(),
-                        );
+        if self.bs_len == 0 {
+            if let Some(vt) = crate::hardware_addon::active_vtable() {
+                if let Some(mv) = vt.v3_matvec_ternary_158() {
+                    if (self.s_ptr as usize) % 4 == 0 {
+                        let mut out = vec![0.0_f32; self.rows];
+                        unsafe {
+                            mv(
+                                self.rows,
+                                self.cols,
+                                self.p_ptr,
+                                self.s_ptr as *const f32,
+                                x.as_ptr(),
+                                out.as_mut_ptr(),
+                            );
+                        }
+                        if let Some(ref core) = self.jepa_core {
+                            core.apply_add(x, &mut out, 1.0);
+                        }
+                        return out;
                     }
-                    if let Some(ref core) = self.jepa_core {
-                        core.apply_add(x, &mut out, 1.0);
-                    }
-                    return out;
                 }
             }
         }
@@ -2554,26 +2564,62 @@ impl CachedTernary158Mat {
         let s_bytes = unsafe { std::slice::from_raw_parts(self.s_ptr, self.s_len) };
         let packed_cols = self.cols / 4;
         const LUT: [f32; 4] = [-1.0, 0.0, 1.0, 0.0];
-        let mut out: Vec<f32> = p_bytes
-            .par_chunks_exact(packed_cols)
-            .zip(s_bytes.par_chunks_exact(4))
-            .with_min_len(32)
-            .map(|(row_b, sc_b)| {
-                let sc = f32::from_le_bytes([sc_b[0], sc_b[1], sc_b[2], sc_b[3]]);
-                let mut acc = 0.0_f32;
-                for (i, &b) in row_b.iter().enumerate() {
-                    if b == 0x55 {
-                        continue;
+        let mut out: Vec<f32> = if self.bs_len >= self.rows * (self.cols / 64) && !self.bs_ptr.is_null() {
+            let bs_bytes = unsafe { std::slice::from_raw_parts(self.bs_ptr, self.bs_len) };
+            let blocks_per_row = self.cols / 64;
+            p_bytes
+                .par_chunks_exact(packed_cols)
+                .zip(s_bytes.par_chunks_exact(4))
+                .zip(bs_bytes.par_chunks_exact(blocks_per_row))
+                .with_min_len(32)
+                .map(|((row_b, sc_b), bs_row)| {
+                    let row_sc = f32::from_le_bytes([sc_b[0], sc_b[1], sc_b[2], sc_b[3]]);
+                    let mut row_acc = 0.0_f32;
+                    for blk in 0..blocks_per_row {
+                        let u8_sc = bs_row[blk];
+                        if u8_sc == 0 {
+                            continue;
+                        }
+                        let p_off = blk * 16;
+                        let mut b_acc = 0.0_f32;
+                        for k in 0..16 {
+                            let b = row_b[p_off + k];
+                            if b == 0x55 {
+                                continue;
+                            }
+                            let base = (p_off + k) * 4;
+                            b_acc += LUT[(b & 3) as usize] * x[base]
+                                + LUT[((b >> 2) & 3) as usize] * x[base + 1]
+                                + LUT[((b >> 4) & 3) as usize] * x[base + 2]
+                                + LUT[((b >> 6) & 3) as usize] * x[base + 3];
+                        }
+                        row_acc += b_acc * (u8_sc as f32);
                     }
-                    let base = i * 4;
-                    acc += LUT[(b & 3) as usize] * x[base]
-                        + LUT[((b >> 2) & 3) as usize] * x[base + 1]
-                        + LUT[((b >> 4) & 3) as usize] * x[base + 2]
-                        + LUT[((b >> 6) & 3) as usize] * x[base + 3];
-                }
-                acc * sc
-            })
-            .collect();
+                    row_acc * row_sc
+                })
+                .collect()
+        } else {
+            p_bytes
+                .par_chunks_exact(packed_cols)
+                .zip(s_bytes.par_chunks_exact(4))
+                .with_min_len(32)
+                .map(|(row_b, sc_b)| {
+                    let sc = f32::from_le_bytes([sc_b[0], sc_b[1], sc_b[2], sc_b[3]]);
+                    let mut acc = 0.0_f32;
+                    for (i, &b) in row_b.iter().enumerate() {
+                        if b == 0x55 {
+                            continue;
+                        }
+                        let base = i * 4;
+                        acc += LUT[(b & 3) as usize] * x[base]
+                            + LUT[((b >> 2) & 3) as usize] * x[base + 1]
+                            + LUT[((b >> 4) & 3) as usize] * x[base + 2]
+                            + LUT[((b >> 6) & 3) as usize] * x[base + 3];
+                    }
+                    acc * sc
+                })
+                .collect()
+        };
         if let Some(ref core) = self.jepa_core {
             core.apply_add(x, &mut out, 1.0);
         }
@@ -2586,31 +2632,33 @@ impl CachedTernary158Mat {
         if seq_len == 1 {
             return self.matvec(x_batch);
         }
-        if let Some(vt) = crate::hardware_addon::active_vtable() {
-            if let Some(mb) = vt.v3_matbatch_ternary_158() {
-                if (self.s_ptr as usize) % 4 == 0 {
-                    let mut out = vec![0.0_f32; seq_len * self.rows];
-                    unsafe {
-                        mb(
-                            self.rows,
-                            self.cols,
-                            seq_len,
-                            self.p_ptr,
-                            self.s_ptr as *const f32,
-                            x_batch.as_ptr(),
-                            out.as_mut_ptr(),
-                        );
-                    }
-                    if let Some(ref core) = self.jepa_core {
-                        for t in 0..seq_len {
-                            core.apply_add(
-                                &x_batch[t * self.cols..(t + 1) * self.cols],
-                                &mut out[t * self.rows..(t + 1) * self.rows],
-                                1.0,
+        if self.bs_len == 0 {
+            if let Some(vt) = crate::hardware_addon::active_vtable() {
+                if let Some(mb) = vt.v3_matbatch_ternary_158() {
+                    if (self.s_ptr as usize) % 4 == 0 {
+                        let mut out = vec![0.0_f32; seq_len * self.rows];
+                        unsafe {
+                            mb(
+                                self.rows,
+                                self.cols,
+                                seq_len,
+                                self.p_ptr,
+                                self.s_ptr as *const f32,
+                                x_batch.as_ptr(),
+                                out.as_mut_ptr(),
                             );
                         }
+                        if let Some(ref core) = self.jepa_core {
+                            for t in 0..seq_len {
+                                core.apply_add(
+                                    &x_batch[t * self.cols..(t + 1) * self.cols],
+                                    &mut out[t * self.rows..(t + 1) * self.rows],
+                                    1.0,
+                                );
+                            }
+                        }
+                        return out;
                     }
-                    return out;
                 }
             }
         }
@@ -10258,13 +10306,14 @@ sys.stdout.buffer.write(img.tobytes())
 // 106 GB ALL-EXPERTS-IN-RAM COMPRESSOR (`1.58-Bit` + `0.33 MB Rank-16 Q8 JEPA`)
 // ============================================================================
 
-/// Compressed `1.58-bit` ternary matrix + `Rank-16 Q8 JEPA` principal residual core.
+/// Compressed `1.58-bit` ternary matrix + `Block-64 U8` scales + `Rank-16 Q8 JEPA` principal residual core.
 #[derive(Debug, Clone)]
 pub struct CompressedJepaMatrix158 {
     pub rows: usize,
     pub cols: usize,
     pub packed_ternary: Vec<u8>,
     pub row_scales: Vec<f32>,
+    pub block_scales: Vec<u8>,
     pub core_b_q8: Vec<u8>,
     pub core_b_scale: Vec<f32>,
     pub core_a_q8: Vec<u8>,
@@ -10274,7 +10323,7 @@ pub struct CompressedJepaMatrix158 {
     pub jepa_err_sq: f64,
 }
 
-/// Telemetry report after compressing a Flash-1017 layer shard to the `106 GB` (`1.58-bit + Rank-16 Q8 JEPA`) format.
+/// Telemetry report after compressing a Flash-1017 layer shard to the `106 GB` (`1.58-bit + Block-64 + Rank-16 Q8 JEPA`) format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Flash1017Jepa106ShardReport {
     pub layer_idx: usize,
@@ -10285,6 +10334,7 @@ pub struct Flash1017Jepa106ShardReport {
     pub savings_percent: f32,
     pub ternary_only_rel_frob_err: f32,
     pub jepa_recovered_rel_frob_err: f32,
+    pub cosine_similarity: f32,
     pub elapsed_secs: f64,
 }
 
@@ -10341,20 +10391,22 @@ pub fn compress_nvfp4_matrix_to_158_jepa_q8(
     };
 
     let packed_ternary_cols = (cols + 3) / 4;
+    let blocks_per_row = cols / 64;
     let mut packed_ternary = vec![0u8; rows * packed_ternary_cols];
     let mut row_scales = Vec::with_capacity(rows);
+    let mut block_scales = vec![0u8; rows * blocks_per_row];
     let mut residual = vec![0.0_f32; rows * cols];
 
     let mut orig_frob_sq = 0.0_f64;
     let mut ternary_err_sq = 0.0_f64;
 
-    // 1. Dequantize true NVFP4 weights -> quantize to optimal LSQ 1.58-bit ternary -> form residual R = W - W_1.58
+    // 1. Dequantize true NVFP4 weights -> Block-64 Lloyd-Max LSQ 1.58-bit ternary -> form residual R = W - W_1.58
+    let mut blk_gammas = vec![0.0_f32; blocks_per_row];
     for r in 0..rows {
         let w_row = &w_bytes[r * packed_cols..(r + 1) * packed_cols];
         let sc_row = &sc_bytes[r * groups_per_row..(r + 1) * groups_per_row];
         let res_row = &mut residual[r * cols..(r + 1) * cols];
 
-        let mut abs_sum = 0.0_f32;
         for g in 0..groups_per_row {
             let g_sc = f8_e4m3_to_f32(sc_row[g]) * global_scale;
             let b_base = g * 8;
@@ -10365,46 +10417,110 @@ pub fn compress_nvfp4_matrix_to_158_jepa_q8(
                 let w1 = FP4_E2M1_LUT[(b >> 4) as usize] * g_sc;
                 res_row[c_base + k * 2] = w0;
                 res_row[c_base + k * 2 + 1] = w1;
-                abs_sum += w0.abs() + w1.abs();
                 orig_frob_sq += (w0 as f64) * (w0 as f64) + (w1 as f64) * (w1 as f64);
             }
         }
 
-        let scale = (abs_sum / (cols as f32)).max(1e-12_f32);
-        let inv_scale = 1.0_f32 / scale;
-        let mut dot_wt = 0.0_f32;
-        let mut dot_tt = 0.0_f32;
         let p_row_start = r * packed_ternary_cols;
+        let mut max_gamma = 0.0_f32;
 
-        for c in 0..cols {
-            let w = res_row[c];
-            let t = (w * inv_scale).round().clamp(-1.0, 1.0) as i8;
-            let tf = t as f32;
-            dot_wt += w * tf;
-            dot_tt += tf * tf;
-            let code = ((t + 1) as u8) & 0b11;
-            packed_ternary[p_row_start + (c >> 2)] |= code << ((c & 3) * 2);
+        for blk in 0..blocks_per_row {
+            let c_start = blk * 64;
+            let w_blk = &res_row[c_start..c_start + 64];
+            let mut sq_sum = 0.0_f32;
+            for &w in w_blk {
+                sq_sum += w * w;
+            }
+            let rms = (sq_sum * (1.0_f32 / 64.0_f32)).sqrt();
+            if rms <= 1e-12 {
+                blk_gammas[blk] = 0.0;
+                let p_blk = &mut packed_ternary[p_row_start + blk * 16..p_row_start + (blk + 1) * 16];
+                p_blk.fill(0x55); // four 0-trits (`code = 1`) packed per byte
+                continue;
+            }
+
+            // Test 4 candidate thresholds around Lloyd-Max optimum (`0.42..0.78 * rms`) to maximize (w·t)^2 / (t·t)
+            let mut best_score = -1.0_f32;
+            let mut best_gamma = 0.0_f32;
+            let mut best_thresh = 0.58_f32 * rms;
+            for &factor in &[0.42_f32, 0.54_f32, 0.66_f32, 0.78_f32] {
+                let th = factor * rms;
+                let mut dot_wt = 0.0_f32;
+                let mut cnt = 0u32;
+                for &w in w_blk {
+                    if w > th {
+                        dot_wt += w;
+                        cnt += 1;
+                    } else if w < -th {
+                        dot_wt -= w;
+                        cnt += 1;
+                    }
+                }
+                if cnt > 0 {
+                    let score = (dot_wt * dot_wt) / (cnt as f32);
+                    if score > best_score {
+                        best_score = score;
+                        best_gamma = dot_wt / (cnt as f32);
+                        best_thresh = th;
+                    }
+                }
+            }
+
+            blk_gammas[blk] = best_gamma;
+            if best_gamma > max_gamma {
+                max_gamma = best_gamma;
+            }
+
+            let p_blk_start = p_row_start + blk * 16;
+            for i in 0..64 {
+                let w = w_blk[i];
+                let code: u8 = if w > best_thresh {
+                    2
+                } else if w < -best_thresh {
+                    0
+                } else {
+                    1
+                };
+                packed_ternary[p_blk_start + (i >> 2)] |= code << ((i & 3) * 2);
+            }
         }
 
-        let opt_gamma = if dot_tt > 0.0 { dot_wt / dot_tt } else { scale };
-        row_scales.push(opt_gamma);
+        let row_sc = if max_gamma > 1e-12 {
+            max_gamma / 255.0_f32
+        } else {
+            0.0_f32
+        };
+        row_scales.push(row_sc);
 
         const LUT: [f32; 4] = [-1.0, 0.0, 1.0, 0.0];
+        let bs_row = &mut block_scales[r * blocks_per_row..(r + 1) * blocks_per_row];
         let p_row = &packed_ternary[p_row_start..p_row_start + packed_ternary_cols];
-        for (i, &pb) in p_row.iter().enumerate() {
-            let base = i * 4;
-            let r0 = res_row[base] - LUT[(pb & 3) as usize] * opt_gamma;
-            let r1 = res_row[base + 1] - LUT[((pb >> 2) & 3) as usize] * opt_gamma;
-            let r2 = res_row[base + 2] - LUT[((pb >> 4) & 3) as usize] * opt_gamma;
-            let r3 = res_row[base + 3] - LUT[((pb >> 6) & 3) as usize] * opt_gamma;
-            res_row[base] = r0;
-            res_row[base + 1] = r1;
-            res_row[base + 2] = r2;
-            res_row[base + 3] = r3;
-            ternary_err_sq += (r0 as f64) * (r0 as f64)
-                + (r1 as f64) * (r1 as f64)
-                + (r2 as f64) * (r2 as f64)
-                + (r3 as f64) * (r3 as f64);
+
+        for blk in 0..blocks_per_row {
+            let u8_sc = if row_sc > 0.0 {
+                (blk_gammas[blk] / row_sc).round().clamp(0.0, 255.0) as u8
+            } else {
+                0
+            };
+            bs_row[blk] = u8_sc;
+            let q_gamma = (u8_sc as f32) * row_sc;
+            let p_blk = &p_row[blk * 16..(blk + 1) * 16];
+            let res_blk = &mut res_row[blk * 64..(blk + 1) * 64];
+            for (i, &pb) in p_blk.iter().enumerate() {
+                let base = i * 4;
+                let r0 = res_blk[base] - LUT[(pb & 3) as usize] * q_gamma;
+                let r1 = res_blk[base + 1] - LUT[((pb >> 2) & 3) as usize] * q_gamma;
+                let r2 = res_blk[base + 2] - LUT[((pb >> 4) & 3) as usize] * q_gamma;
+                let r3 = res_blk[base + 3] - LUT[((pb >> 6) & 3) as usize] * q_gamma;
+                res_blk[base] = r0;
+                res_blk[base + 1] = r1;
+                res_blk[base + 2] = r2;
+                res_blk[base + 3] = r3;
+                ternary_err_sq += (r0 as f64) * (r0 as f64)
+                    + (r1 as f64) * (r1 as f64)
+                    + (r2 as f64) * (r2 as f64)
+                    + (r3 as f64) * (r3 as f64);
+            }
         }
     }
 
@@ -10517,6 +10633,7 @@ pub fn compress_nvfp4_matrix_to_158_jepa_q8(
         cols,
         packed_ternary,
         row_scales,
+        block_scales,
         core_b_q8,
         core_b_scale,
         core_a_q8,
@@ -10661,6 +10778,12 @@ impl Flash1017Jepa106Compressor {
                 dtype: "F32".to_string(),
                 shape: vec![m.rows],
                 data: f32_slice_to_bytes(&m.row_scales),
+            });
+            owned_tensors.push(OwnedTensor {
+                name: format!("{}.block_scales", prefix),
+                dtype: "U8".to_string(),
+                shape: vec![m.rows, m.cols / 64],
+                data: m.block_scales,
             });
             owned_tensors.push(OwnedTensor {
                 name: format!("{}.core_b_q8", prefix),
@@ -10823,6 +10946,8 @@ impl Flash1017Jepa106Compressor {
         let orig_norm = total_orig_sq.sqrt().max(1e-12);
         let ternary_only_rel_frob_err = (total_tern_err_sq.sqrt() / orig_norm) as f32;
         let jepa_recovered_rel_frob_err = (total_jepa_err_sq.sqrt() / orig_norm) as f32;
+        let cosine_similarity =
+            (1.0_f64 - (total_jepa_err_sq / total_orig_sq.max(1e-12))).max(0.0).sqrt() as f32;
 
         Ok(Flash1017Jepa106ShardReport {
             layer_idx,
@@ -10833,6 +10958,7 @@ impl Flash1017Jepa106Compressor {
             savings_percent,
             ternary_only_rel_frob_err,
             jepa_recovered_rel_frob_err,
+            cosine_similarity,
             elapsed_secs: t0.elapsed().as_secs_f64(),
         })
     }

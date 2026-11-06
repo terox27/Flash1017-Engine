@@ -1750,13 +1750,14 @@ fn main() {
                     total_orig += rep.original_file_bytes;
                     total_comp += rep.compressed_file_bytes;
                     println!(
-                        "KLAR på {:.1}s! {:.2} GB -> {:.2} GB (-{:.1}%) | Frob-fel: 1.58b={:.4} -> JEPA-Q8={:.4}",
+                        "KLAR på {:.1}s! {:.2} GB -> {:.2} GB (-{:.1}%) | Frob-fel: 1.58b={:.4} -> JEPA-Q8={:.4} | Cos-likhet: {:.2}%",
                         rep.elapsed_secs,
                         rep.original_file_bytes as f64 / 1e9,
                         rep.compressed_file_bytes as f64 / 1e9,
                         rep.savings_percent,
                         rep.ternary_only_rel_frob_err,
-                        rep.jepa_recovered_rel_frob_err
+                        rep.jepa_recovered_rel_frob_err,
+                        rep.cosine_similarity * 100.0
                     );
                 }
                 Err(e) => {
